@@ -1,20 +1,19 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.models as models
 
-# إعداد صفحة التطبيق لتكون متجاوبة مع شاشة الموبايل
 st.set_page_config(page_title="Bank Signature Verification", page_icon="✍️", layout="centered")
 
-st.title("✍️ نظام التحقق من التوقيع البنكي")
-st.write("قم بمسح (Scan) أو رفع 3 إمضاءات مرجعية للعميل، ثم أدخل الإمضاء الرابع للتحقق.")
+st.title("✍️ التحقق من التوقيع البنكي")
+st.info("📱 **للاستخدام من الموبايل:** اضغطي على **Browse files** في كل خانة، واختاري **الكاميرا (Camera)** لتصوير الإمضاء مباشرة أو **المعرض**.")
 
-# 1. تعريف نفس معمارية الموديل
+# 1. معمارية الموديل
 class SignatureNet(nn.Module):
     def __init__(self):
         super(SignatureNet, self).__init__()
@@ -39,10 +38,15 @@ def load_model():
 
 model = load_model()
 
-# 2. دالة معالجة صورة الكاميرا أو الملف المرفوع
+# 2. دالة معالجة صور الموبايل (تصحيح الدوران وتصغير الحجم وعزل الخلفية)
 def preprocess_signature(pil_img):
+    # تصحيح دوران الصورة التلقائي لكاميرا الموبايل (EXIF)
+    pil_img = ImageOps.exif_transpose(pil_img)
+    
+    # تصغير الصورة لو جاية بدقة عالية من كاميرا الفون لتسريع المعالجة
+    pil_img.thumbnail((800, 800))
+    
     img = np.array(pil_img.convert("L"))
-    # تحسين التباين للتعامل مع إضاءة كاميرا الموبايل
     img = cv2.GaussianBlur(img, (5, 5), 0)
     _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
@@ -66,53 +70,47 @@ def get_embedding(pil_img):
         emb = model(tensor)
     return emb, processed
 
-# 3. واجهة إدخال الصور (كاميرا أو رفع ملف)
-input_method = st.radio("اختر طريقة إدخال الإمضاءات:", ["📸 تصوير بالكاميرا (Scan)", "📁 رفع صور من الجهاز"], horizontal=True)
-
-def get_image_input(label, key):
-    if input_method == "📸 تصوير بالكاميرا (Scan)":
-        return st.camera_input(label, key=key)
-    else:
-        return st.file_uploader(label, type=["png", "jpg", "jpeg"], key=key)
-
-st.subheader("1️⃣ الإمضاءات المرجعية الثلاثة (للعميل)")
-ref1 = get_image_input("الإمضاء المرجعي الأول", "r1")
-ref2 = get_image_input("الإمضاء المرجعي الثاني", "r2")
-ref3 = get_image_input("الإمضاء المرجعي الثالث", "r3")
+# 3. واجهة رفع/تصوير سريعة للموبايل (بدون تعليق كاميرا المتصفح)
+st.subheader("1️⃣ الإمضاءات المرجعية الثلاثة")
+ref1 = st.file_uploader("📸 الإمضاء الأول", type=["png", "jpg", "jpeg"], key="r1")
+ref2 = st.file_uploader("📸 الإمضاء الثاني", type=["png", "jpg", "jpeg"], key="r2")
+ref3 = st.file_uploader("📸 الإمضاء الثالث", type=["png", "jpg", "jpeg"], key="r3")
 
 st.divider()
-st.subheader("2️⃣ الإمضاء الرابع (المراد اختباره)")
-test_img_file = get_image_input("صورة الإمضاء الرابع للتحقق", "test")
+st.subheader("2️⃣ الإمضاء الرابع (للاختبار)")
+test_img_file = st.file_uploader("📸 الإمضاء الرابع", type=["png", "jpg", "jpeg"], key="test")
 
-# 4. زر التحقق وحساب الدقة
+# عرض مصغرات سريعة للتأكد إن الصور اترفعت صح
+cols = st.columns(4)
+for idx, f in enumerate([ref1, ref2, ref3, test_img_file]):
+    if f is not None:
+        cols[idx].image(ImageOps.exif_transpose(Image.open(f)), caption=f"#{idx+1}", use_container_width=True)
+
+# 4. زر التحقق
 if st.button("🔍 تحقق من الإمضاء الآن", use_container_width=True, type="primary"):
     if ref1 and ref2 and ref3 and test_img_file:
-        with st.spinner("جاري تحليل الخطوط والانحناءات..."):
+        with st.spinner("جاري فحص التوقيع..."):
             imgs = [Image.open(f) for f in [ref1, ref2, ref3]]
             test_pil = Image.open(test_img_file)
             
-            # استخراج البصمات الثلاث وحساب المتوسط
             embs = [get_embedding(im)[0] for im in imgs]
             mean_ref_emb = F.normalize(torch.mean(torch.stack(embs), dim=0), p=2, dim=1)
             
-            # استخراج بصمة الإمضاء الرابع
             test_emb, processed_test = get_embedding(test_pil)
             
-            # حساب نسبة التطابق
             similarity = F.cosine_similarity(mean_ref_emb, test_emb).item()
-            # تحويل القيمة من [-1, 1] أو [0, 1] إلى نسبة مئوية واضحة
             accuracy_pct = max(0.0, min(100.0, similarity * 100))
             
         st.divider()
-        st.metric(label="نسبة التطابق (Accuracy / Similarity)", value=f"{accuracy_pct:.2f}%")
+        st.metric(label="نسبة التطابق", value=f"{accuracy_pct:.2f}%")
         st.progress(int(accuracy_pct))
         
         if accuracy_pct >= 80.0:
-            st.success("✅ **النتيجة: هو نفس الشخص** (التوقيع مطابق ومعتمد).")
+            st.success("✅ **النتيجة: هو نفس الشخص** (التوقيع مطابق).")
         else:
-            st.error("❌ **النتيجة: شخص مختلف / توقيع مزور** (نسبة التطابق أقل من الحد المسموح).")
+            st.error("❌ **النتيجة: شخص مختلف / توقيع مزور**.")
             
-        with st.expander("عرض شكل الإمضاء بعد المعالجة (كما يراه الذكاء الاصطناعي)"):
-            st.image(processed_test, caption="الإمضاء الرابع بعد عزل الخلفية", width=250)
+        with st.expander("عرض الإمضاء بعد عزل الخلفية"):
+            st.image(processed_test, width=220)
     else:
-        st.warning("⚠️ يرجى إدخال جميع الإمضاءات الأربعة أولاً.")
+        st.warning("⚠️ يرجى تصوير أو اختيار الـ 4 إمضاءات أولاً.")
